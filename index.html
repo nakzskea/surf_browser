@@ -1,0 +1,785 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Surf BSP Viewer</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0d12; color: #e6e8ee; font: 14px/1.4 system-ui, sans-serif; overflow: hidden; }
+  #maps { position: fixed; inset: 0; display: grid; place-content: center; gap: 10px; background: #0b0d12ee; z-index: 1; }
+  [hidden] { display: none !important; }
+  #maps h1 { margin: 0 0 8px; font-size: 20px; text-align: center; }
+  #maps button { min-width: 260px; }
+  #list { display: grid; gap: 10px; }
+  #list div { display: flex; gap: 6px; }
+  #list div button:first-child { flex: 1; }
+  #list div button + button { min-width: 0; }
+  #menu label { display: flex; align-items: center; gap: 6px; background: #0b0d12cc; border: 1px solid #3a4256; border-radius: 8px; padding: 0 10px; }
+  #menu input { width: 56px; background: transparent; color: inherit; border: 0; font: inherit; }
+  #maps p { margin: 4px 0 0; max-width: 360px; color: #ff9a8a; white-space: pre-wrap; }
+  button { background: #0b0d12cc; color: inherit; border: 1px solid #3a4256; border-radius: 8px; padding: 8px 14px; font: inherit; cursor: pointer; }
+  button:hover { border-color: #6aa3ff; }
+  #hud { position: fixed; top: 10px; left: 10px; background: #0b0d12cc; padding: 8px 12px; border-radius: 8px; white-space: pre; font: 12px/1.5 ui-monospace, monospace; pointer-events: none; }
+  #menu { position: fixed; top: 10px; right: 10px; display: flex; gap: 6px; }
+  #speed { position: fixed; bottom: 18%; left: 50%; transform: translateX(-50%); font: 700 22px/1.4 ui-monospace, monospace; text-align: center; white-space: pre; text-shadow: 0 1px 4px #000; pointer-events: none; }
+</style>
+</head>
+<body>
+<div id="maps"><h1>Choisis une map</h1>
+  <div id="list"></div>
+  <button id="load">Charger une map (.bsp)…</button><input id="file" type="file" accept=".bsp" hidden>
+  <p id="err" hidden></p></div>
+<div id="hud" hidden></div>
+<div id="menu" hidden>
+  <button id="maps-btn">Maps (M)</button>
+  <button id="mode">Mode : surf (V)</button>
+  <button id="respawn">Respawn (R)</button>
+  <button id="reset-zones">Reset zones</button>
+  <label>Sensi <input id="sens" type="number" min="0.1" max="20" step="0.1"></label>
+</div>
+<div id="speed" hidden></div>
+<script src="https://cdn.jsdelivr.net/npm/three@0.149.0/build/three.min.js"></script>
+<script>
+// Maps disponibles : fichiers maps/<nom>.bsp à côté de cette page
+const MAPS = ['surf_utopia_v3'];
+
+// Réglages type serveur surf CS:GO (unités Source, secondes)
+const CFG = { tick: 1 / 100, gravity: 800, airaccelerate: 150, accelerate: 10, friction: 4, stopspeed: 75,
+  maxspeed: 250, maxvelocity: 3500, jump: 301.993, stepsize: 18, eye: 64 };
+
+// ---------- BSP parser (VBSP v21, CS:GO) ----------
+const SURF_SKY2D = 0x2, SURF_SKY = 0x4, SURF_TRIGGER = 0x40, SURF_NODRAW = 0x80, SURF_HINT = 0x100, SURF_SKIP = 0x200;
+const HIDDEN = SURF_SKY2D | SURF_SKY | SURF_TRIGGER | SURF_NODRAW | SURF_HINT | SURF_SKIP;
+
+function parseBSP(buf) {
+  const dv = new DataView(buf);
+  const ident = String.fromCharCode(...new Uint8Array(buf, 0, 4));
+  if (ident !== 'VBSP') throw new Error('Pas un fichier VBSP (Source)');
+  const version = dv.getInt32(4, true);
+  const lump = i => {
+    const o = 8 + i * 16;
+    const ofs = dv.getInt32(o, true), len = dv.getInt32(o + 4, true), fourCC = dv.getInt32(o + 12, true);
+    // shortcut: lumps compressés LZMA non gérés, à ajouter si une map le demande
+    if (fourCC !== 0) throw new Error(`Lump ${i} compressé (LZMA), non supporté`);
+    return { ofs, len };
+  };
+  const each = (l, size, fn) => { for (let o = l.ofs, i = 0; o < l.ofs + l.len; o += size, i++) fn(o, i); };
+  const i32 = o => dv.getInt32(o, true), f32 = o => dv.getFloat32(o, true), u16 = o => dv.getUint16(o, true);
+
+  // Entités
+  const ENT = lump(0);
+  const ents = (new TextDecoder().decode(new Uint8Array(buf, ENT.ofs, ENT.len)).match(/\{[^}]*\}/g) || []).map(b => {
+    const e = {};
+    for (const [, k, v] of b.matchAll(/"([^"]*)"\s+"([^"]*)"/g)) e[k] = v;
+    return e;
+  });
+  const vec = s => (s || '0 0 0').split(/\s+/).map(Number);
+
+  // Géométrie
+  const V = lump(3), E = lump(12), SE = lump(13), F = lump(7), TI = lump(6), TD = lump(2), SD = lump(43), ST = lump(44), M = lump(14);
+  const verts = new Float32Array(buf.slice(V.ofs, V.ofs + V.len));
+  const edges = new Uint16Array(buf.slice(E.ofs, E.ofs + E.len));
+  const surfedges = new Int32Array(buf.slice(SE.ofs, SE.ofs + SE.len));
+  const strData = new Uint8Array(buf, SD.ofs, SD.len);
+  const texName = id => {
+    const start = i32(ST.ofs + id * 4);
+    let end = start; while (strData[end]) end++;
+    return new TextDecoder().decode(strData.subarray(start, end));
+  };
+  const texdata = [], texinfo = [], models = [];
+  each(TD, 32, o => texdata.push({ color: [f32(o), f32(o + 4), f32(o + 8)], name: texName(i32(o + 12)) }));
+  each(TI, 72, o => texinfo.push({ flags: i32(o + 64), texdata: i32(o + 68) }));
+  each(M, 48, o => models.push({ mins: [f32(o), f32(o + 4), f32(o + 8)], maxs: [f32(o + 12), f32(o + 16), f32(o + 20)],
+    headnode: i32(o + 36), firstface: i32(o + 40), numfaces: i32(o + 44), origin: [0, 0, 0] }));
+  // Les brush entities sont stockées en coordonnées locales : on les place à l'origine de l'entité
+  const modelEnt = [];
+  for (const e of ents) if (/^\*\d+$/.test(e.model || '')) {
+    const mi = +e.model.slice(1);
+    models[mi].origin = vec(e.origin);
+    modelEnt[mi] = e;
+  }
+
+  // Triangulation en éventail, coordonnées Source (Z haut) -> three (Y haut)
+  const pos = [], col = [];
+  let faces = 0, skipped = 0;
+  models.forEach((m, mi) => {
+    const e = modelEnt[mi];
+    if (mi > 0 && (!e || /^trigger_/.test(e.classname))) return;
+    const [ox, oy, oz] = m.origin;
+    const vert = edge => {
+      const se = surfedges[edge];
+      const vi = se >= 0 ? edges[se * 2] : edges[-se * 2 + 1];
+      return [verts[vi * 3] + ox, verts[vi * 3 + 2] + oz, -(verts[vi * 3 + 1] + oy)];
+    };
+    for (let f = m.firstface; f < m.firstface + m.numfaces; f++) {
+      const o = F.ofs + f * 56;
+      const firstedge = i32(o + 4), numedges = dv.getInt16(o + 8, true);
+      const ti = dv.getInt16(o + 10, true), disp = dv.getInt16(o + 12, true);
+      const info = texinfo[ti];
+      const td = info && texdata[info.texdata];
+      // shortcut: displacements ignorés (rares en surf), à faire si une map en a
+      if (!td || disp !== -1 || (info.flags & HIDDEN) || /^tools\//i.test(td.name)) { skipped++; continue; }
+      const c = td.color.map(x => Math.sqrt(x)); // reflectivity linéaire -> sRGB approx
+      const v0 = vert(firstedge);
+      for (let k = 1; k < numedges - 1; k++) {
+        pos.push(...v0, ...vert(firstedge + k), ...vert(firstedge + k + 1));
+        col.push(...c, ...c, ...c);
+      }
+      faces++;
+    }
+  });
+
+  // Static props (game lump 'prps') : modèles embarqués dans le pakfile
+  const PK = lump(40), GL = lump(35), pak = readPak(buf, PK.ofs, PK.len), hulls = [];
+  let props = 0;
+  for (let g = 0; g < i32(GL.ofs); g++) {
+    const h = GL.ofs + 4 + g * 16;
+    if (String.fromCharCode(...new Uint8Array(buf, h, 4)) !== 'prps') continue;
+    // shortcut: game lump compressé non géré, à ajouter si une map le demande
+    if (u16(h + 4) & 1) { console.warn('static props compressés, ignorés'); continue; }
+    const ofs = i32(h + 8), end = ofs + i32(h + 12), nd = i32(ofs), dict = [];
+    for (let k = 0; k < nd; k++) dict.push(new TextDecoder().decode(new Uint8Array(buf, ofs + 4 + k * 128, 128)).replace(/\0[^]*$/, '').toLowerCase());
+    let o = ofs + 4 + nd * 128;
+    o += 4 + i32(o) * 2; // liste des leafs, inutile ici
+    const np = i32(o), cache = {};
+    o += 4;
+    const size = (end - o) / np;
+    for (let k = 0; k < np; k++, o += size) {
+      const name = dict[u16(o + 24)];
+      const mdl = name in cache ? cache[name] : (cache[name] = loadModel(pak, name));
+      if (!mdl) { console.warn('modèle absent du pakfile :', name); continue; }
+      const tf = propTransform([f32(o), f32(o + 4), f32(o + 8)], [f32(o + 12), f32(o + 16), f32(o + 20)]);
+      for (const v of mdl.tris) { const w = tf(v); pos.push(w[0], w[2], -w[1]); col.push(0.78, 0.76, 0.72); }
+      if (dv.getUint8(o + 30)) for (const hl of mdl.hulls) hulls.push(hullPlanes(hl.pts.map(tf), hl.faces)); // solid != SOLID_NONE
+      props++;
+    }
+  }
+  console.assert(pos.length % 9 === 0, 'triangles incomplets');
+
+  // Collision : arbre BSP + brushes
+  const PL = lump(1), N = lump(5), LF = lump(10), LB = lump(17), B = lump(18), BS = lump(19);
+  if (dv.getInt32(8 + 10 * 16 + 8, true) !== 1) throw new Error('Version de LEAFS non gérée');
+  const planes = new Float32Array(PL.len / 20 * 4);
+  each(PL, 20, (o, i) => planes.set([f32(o), f32(o + 4), f32(o + 8), f32(o + 12)], i * 4));
+  const nodes = new Int32Array(N.len / 32 * 3);
+  each(N, 32, (o, i) => nodes.set([i32(o), i32(o + 4), i32(o + 8)], i * 3));
+  const leafs = new Int32Array(LF.len / 32 * 2);
+  each(LF, 32, (o, i) => leafs.set([u16(o + 24), u16(o + 26)], i * 2));
+  const leafbrushes = new Uint16Array(buf.slice(LB.ofs, LB.ofs + LB.len));
+  const brushes = new Int32Array(B.len / 12 * 3);
+  each(B, 12, (o, i) => brushes.set([i32(o), i32(o + 4), i32(o + 8)], i * 3));
+  // Plans de chaque brush à plat [nx, ny, nz, d, ...], même format que les hulls des props
+  const brushPlanes = [];
+  each(B, 12, o => {
+    const first = i32(o), pl = new Float32Array(i32(o + 4) * 4);
+    for (let s = 0; s < pl.length / 4; s++) pl.set(planes.subarray(u16(BS.ofs + (first + s) * 8) * 4, u16(BS.ofs + (first + s) * 8) * 4 + 4), s * 4);
+    brushPlanes.push(pl);
+  });
+
+  // Monde + func_brush solides
+  const solids = [models[0]];
+  models.forEach((m, mi) => { const e = modelEnt[mi]; if (e && e.classname === 'func_brush' && e.Solidity !== '1') solids.push(m); });
+
+  const sp = ents.find(e => /^info_player_(counter)?terrorist$/.test(e.classname));
+  const spawn = sp ? { pos: vec(sp.origin), yaw: vec(sp.angles)[1] } : { pos: [0, 0, 0], yaw: 0 };
+
+  return { version, faces, props, tris: pos.length / 9, pos: new Float32Array(pos), col: new Float32Array(col), spawn,
+    col_: { planes, nodes, leafs, leafbrushes, brushes, brushPlanes, solids, hulls } };
+}
+
+// ---------- Pakfile (zip) et static props ----------
+function readPak(buf, ofs, len) {
+  const dv = new DataView(buf, ofs, len), files = {};
+  let eocd = len - 22;
+  while (eocd >= 0 && dv.getUint32(eocd, true) !== 0x06054b50) eocd--;
+  if (eocd < 0) return files;
+  let p = dv.getUint32(eocd + 16, true);
+  for (let i = dv.getUint16(eocd + 10, true); i > 0; i--) {
+    const method = dv.getUint16(p + 10, true), size = dv.getUint32(p + 20, true), lh = dv.getUint32(p + 42, true);
+    const nl = dv.getUint16(p + 28, true), xl = dv.getUint16(p + 30, true), cl = dv.getUint16(p + 32, true);
+    const name = new TextDecoder().decode(new Uint8Array(buf, ofs + p + 46, nl)).toLowerCase();
+    // shortcut: seuls les fichiers stockés sans compression sont lus (cas d'utopia), LZMA à ajouter si une map le demande
+    if (method === 0) files[name] = new DataView(buf, ofs + lh + 30 + dv.getUint16(lh + 26, true) + dv.getUint16(lh + 28, true), size);
+    p += 46 + nl + xl + cl;
+  }
+  return files;
+}
+
+// Modèle Source : triangles LOD0 (MDL + VVD + VTX) et pièces convexes de collision (PHY), en coordonnées Source
+function loadModel(pak, name) {
+  const file = ext => pak[name.replace(/\.mdl$/, ext)];
+  const mdl = file('.mdl'), vvd = file('.vvd'), vtx = file('.dx90.vtx'), phy = file('.phy');
+  if (!mdl || !vvd || !vtx) return null;
+  const i32 = (v, o) => v.getInt32(o, true), u16 = (v, o) => v.getUint16(o, true), f32 = (v, o) => v.getFloat32(o, true);
+
+  const nFix = i32(vvd, 48), fixStart = i32(vvd, 52), vStart = i32(vvd, 56), verts = [];
+  const ranges = nFix ? Array.from({ length: nFix }, (_, k) => [i32(vvd, fixStart + k * 12 + 4), i32(vvd, fixStart + k * 12 + 8)]) : [[0, i32(vvd, 16)]];
+  for (const [s, n] of ranges) for (let v = s; v < s + n; v++) { const o = vStart + v * 48 + 16; verts.push([f32(vvd, o), f32(vvd, o + 4), f32(vvd, o + 8)]); }
+
+  // On descend bodyparts > models > meshes en parallèle dans le MDL et le VTX
+  const tris = [], sgSize = i32(mdl, 4) >= 49 ? 33 : 25, bpi = i32(mdl, 236), vbpi = i32(vtx, 32);
+  for (let b = 0; b < i32(mdl, 232); b++) {
+    const bp = bpi + b * 16, vbp = vbpi + b * 8;
+    for (let m = 0; m < i32(mdl, bp + 4); m++) {
+      const mo = bp + i32(mdl, bp + 12) + m * 148, vm = vbp + i32(vtx, vbp + 4) + m * 8;
+      const base = i32(mdl, mo + 84) / 48, lod = vm + i32(vtx, vm + 4);
+      for (let k = 0; k < i32(mdl, mo + 72); k++) {
+        const vertOff = base + i32(mdl, mo + i32(mdl, mo + 76) + k * 116 + 12);
+        const vmesh = lod + i32(vtx, lod + 4) + k * 9;
+        for (let s = 0; s < i32(vtx, vmesh); s++) {
+          const sg = vmesh + i32(vtx, vmesh + 4) + s * sgSize, vo = sg + i32(vtx, sg + 4), io = sg + i32(vtx, sg + 12);
+          for (let i = 0; i < i32(vtx, sg + 8); i++) tris.push(verts[vertOff + u16(vtx, vo + u16(vtx, io + i * 2) * 9 + 4)]);
+        }
+      }
+    }
+  }
+
+  // PHY : chaque "ledge" IVP est une pièce convexe (triangles + points en mètres)
+  const hulls = [];
+  for (let s = 16, n = phy ? i32(phy, 8) : 0; n > 0; n--, s += 4 + i32(phy, s)) {
+    // shortcut: ancien format PHY sans en-tête 'VPHY' ignoré, à ajouter si un modèle le demande
+    if (i32(phy, s + 4) !== 0x59485056) continue;
+    for (let ls = s + 80, ptsStart = Infinity; ls < ptsStart;) {
+      const cpo = i32(phy, ls), ntri = phy.getInt16(ls + 12, true), local = new Map(), pts = [], faces = [];
+      ptsStart = Math.min(ptsStart, ls + cpo);
+      for (let t = 0; t < ntri; t++) faces.push([0, 1, 2].map(e => {
+        const i = u16(phy, ls + 16 + t * 16 + 4 + e * 4);
+        if (!local.has(i)) {
+          const o = ls + cpo + i * 16;
+          local.set(i, pts.length);
+          pts.push([f32(phy, o) / 0.0254, f32(phy, o + 8) / 0.0254, -f32(phy, o + 4) / 0.0254]); // IVP (m, Y bas) -> Source
+        }
+        return local.get(i);
+      }));
+      // has_children_flag : ce "ledge" est l'enveloppe convexe de tout le modèle (pour l'arbre IVP), pas une vraie pièce
+      if (!(i32(phy, ls + 8) & 3)) hulls.push({ pts, faces });
+      ls += 16 + ntri * 16;
+    }
+  }
+  return { tris, hulls };
+}
+
+// AngleMatrix de Source : (pitch, yaw, roll) en degrés
+function propTransform(origin, [p, y, r]) {
+  const R = Math.PI / 180, sp = Math.sin(p * R), cp = Math.cos(p * R), sy = Math.sin(y * R), cy = Math.cos(y * R), sr = Math.sin(r * R), cr = Math.cos(r * R);
+  return v => [
+    cp * cy * v[0] + (sr * sp * cy - cr * sy) * v[1] + (cr * sp * cy + sr * sy) * v[2] + origin[0],
+    cp * sy * v[0] + (sr * sp * sy + cr * cy) * v[1] + (cr * sp * sy - sr * cy) * v[2] + origin[1],
+    -sp * v[0] + sr * cp * v[1] + cr * cp * v[2] + origin[2]];
+}
+
+// Pièce convexe -> plans orientés vers l'extérieur + biseaux axiaux
+function hullPlanes(pts, faces) {
+  const c = [0, 1, 2].map(k => pts.reduce((s, p) => s + p[k], 0) / pts.length), pl = [];
+  for (const [a, b, d] of faces) {
+    const A = pts[a], u = pts[b].map((x, k) => x - A[k]), v = pts[d].map((x, k) => x - A[k]);
+    let n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+    const len = Math.hypot(...n);
+    if (len < 1e-6) continue;
+    n = n.map(x => x / len);
+    const dist = n[0] * A[0] + n[1] * A[1] + n[2] * A[2], out = n[0] * c[0] + n[1] * c[1] + n[2] * c[2] - dist > 0 ? -1 : 1;
+    pl.push(n[0] * out, n[1] * out, n[2] * out, dist * out);
+  }
+  const mins = [0, 1, 2].map(k => Math.min(...pts.map(p => p[k]))), maxs = [0, 1, 2].map(k => Math.max(...pts.map(p => p[k])));
+  // shortcut: biseaux axiaux seulement (pas ceux des arêtes) : la boîte peut accrocher très légèrement près des arêtes obliques
+  pl.push(1, 0, 0, maxs[0], -1, 0, 0, -mins[0], 0, 1, 0, maxs[1], 0, -1, 0, -mins[1], 0, 0, 1, maxs[2], 0, 0, -1, -mins[2]);
+  return { planes: new Float64Array(pl), mins, maxs };
+}
+
+// ---------- Trace AABB contre les brushes (port de CM_BoxTrace) ----------
+const MASK_PLAYERSOLID = 0x1 | 0x2 | 0x8 | 0x4000 | 0x10000; // solid, window, grate, moveable, playerclip
+const DIST_EPSILON = 0.03125;
+const HULL = [16, 16, 36]; // demi-taille joueur debout (32x32x72), centre à +36 du sol
+// shortcut: pas d'accroupi (hull 54), à ajouter si on veut le duck
+let W = null, checked = null, checkCount = 0;
+const tr = { fraction: 1, n: null, startsolid: false, allsolid: false };
+
+// Brush ou pièce convexe de prop : planes = [nx, ny, nz, d, ...]
+function clipConvex(planes) {
+  let enter = -1, leave = 1, startout = false, getout = false, cp = -1;
+  for (let p = 0; p < planes.length; p += 4) {
+    const nx = planes[p], ny = planes[p + 1], nz = planes[p + 2];
+    const dist = planes[p + 3] + HULL[0] * Math.abs(nx) + HULL[1] * Math.abs(ny) + HULL[2] * Math.abs(nz);
+    const d1 = T.sx * nx + T.sy * ny + T.sz * nz - dist;
+    const d2 = T.ex * nx + T.ey * ny + T.ez * nz - dist;
+    if (d2 > 0) getout = true;
+    if (d1 > 0) startout = true;
+    // tolérance sur d2 >= d1 : en glissant parallèlement à la rampe, l'arrondi donne d2 à peine < d1 et la trace bloquait à fraction 0
+    if (d1 > 0 && (d2 >= DIST_EPSILON || d2 >= d1 - 1e-5)) return;
+    if (d1 <= 0 && d2 <= 0) continue;
+    if (d1 > d2) { const f = Math.max(0, (d1 - DIST_EPSILON) / (d1 - d2)); if (f > enter) { enter = f; cp = p; } }
+    else { const f = Math.min(1, (d1 + DIST_EPSILON) / (d1 - d2)); if (f < leave) leave = f; }
+  }
+  if (!startout) { tr.startsolid = true; if (!getout) { tr.allsolid = true; tr.fraction = 0; } return; }
+  if (enter < leave && enter > -1 && enter < tr.fraction) { tr.fraction = Math.max(0, enter); tr.n = [planes[cp], planes[cp + 1], planes[cp + 2]]; }
+}
+
+function hullCheck(node, f1, f2, x1, y1, z1, x2, y2, z2) {
+  if (tr.fraction <= f1) return;
+  if (node < 0) {
+    const { leafs, leafbrushes, brushes, brushPlanes } = W, l = -1 - node;
+    for (let i = leafs[l * 2]; i < leafs[l * 2] + leafs[l * 2 + 1]; i++) {
+      const b = leafbrushes[i];
+      if (checked[b] === checkCount) continue;
+      checked[b] = checkCount;
+      if (brushes[b * 3 + 2] & MASK_PLAYERSOLID) clipConvex(brushPlanes[b]);
+      if (tr.allsolid) return;
+    }
+    return;
+  }
+  const { nodes, planes } = W, p = nodes[node * 3] * 4;
+  const nx = planes[p], ny = planes[p + 1], nz = planes[p + 2], d = planes[p + 3];
+  const t1 = x1 * nx + y1 * ny + z1 * nz - d, t2 = x2 * nx + y2 * ny + z2 * nz - d;
+  const off = HULL[0] * Math.abs(nx) + HULL[1] * Math.abs(ny) + HULL[2] * Math.abs(nz);
+  if (t1 >= off && t2 >= off) return hullCheck(nodes[node * 3 + 1], f1, f2, x1, y1, z1, x2, y2, z2);
+  if (t1 < -off && t2 < -off) return hullCheck(nodes[node * 3 + 2], f1, f2, x1, y1, z1, x2, y2, z2);
+  let side = 0, frac = 1, frac2 = 0;
+  if (t1 < t2) { const id = 1 / (t1 - t2); side = 1; frac2 = (t1 + off + DIST_EPSILON) * id; frac = (t1 - off + DIST_EPSILON) * id; }
+  else if (t1 > t2) { const id = 1 / (t1 - t2); frac2 = (t1 - off - DIST_EPSILON) * id; frac = (t1 + off + DIST_EPSILON) * id; }
+  frac = Math.min(1, Math.max(0, frac)); frac2 = Math.min(1, Math.max(0, frac2));
+  let mf = f1 + (f2 - f1) * frac;
+  hullCheck(nodes[node * 3 + 1 + side], f1, mf, x1, y1, z1, x1 + frac * (x2 - x1), y1 + frac * (y2 - y1), z1 + frac * (z2 - z1));
+  mf = f1 + (f2 - f1) * frac2;
+  hullCheck(nodes[node * 3 + 2 - side], mf, f2, x1 + frac2 * (x2 - x1), y1 + frac2 * (y2 - y1), z1 + frac2 * (z2 - z1), x2, y2, z2);
+}
+
+const T = { sx: 0, sy: 0, sz: 0, ex: 0, ey: 0, ez: 0 };
+// start/end = origine du joueur (pieds). Retourne { fraction, endpos, normal, startsolid, allsolid }
+function traceHull(start, end) {
+  const best = { fraction: 1, startsolid: false, allsolid: false, normal: [0, 0, 0] };
+  const sweep = ([ox, oy, oz], fn) => {
+    T.sx = start[0] - ox; T.sy = start[1] - oy; T.sz = start[2] + HULL[2] - oz;
+    T.ex = end[0] - ox; T.ey = end[1] - oy; T.ez = end[2] + HULL[2] - oz;
+    tr.fraction = 1; tr.n = null; tr.startsolid = tr.allsolid = false;
+    fn();
+    if (tr.startsolid) best.startsolid = true;
+    if (tr.allsolid) best.allsolid = true;
+    if (tr.fraction < best.fraction) { best.fraction = tr.fraction; best.normal = tr.n || [0, 0, 0]; }
+  };
+  for (const m of W.solids) sweep(m.origin, () => { checkCount++; hullCheck(m.headnode, 0, 1, T.sx, T.sy, T.sz, T.ex, T.ey, T.ez); });
+  // Props : test de boîte englobante du mouvement avant le test précis
+  const lo = [0, 1, 2].map(k => Math.min(start[k], end[k]) - (k < 2 ? HULL[k] : 0)), hi = [0, 1, 2].map(k => Math.max(start[k], end[k]) + (k < 2 ? HULL[k] : 2 * HULL[2]));
+  sweep([0, 0, 0], () => {
+    for (const h of W.hulls)
+      if (h.mins[0] <= hi[0] && h.maxs[0] >= lo[0] && h.mins[1] <= hi[1] && h.maxs[1] >= lo[1] && h.mins[2] <= hi[2] && h.maxs[2] >= lo[2]) clipConvex(h.planes);
+  });
+  const f = best.fraction;
+  best.endpos = [start[0] + f * (end[0] - start[0]), start[1] + f * (end[1] - start[1]), start[2] + f * (end[2] - start[2])];
+  return best;
+}
+
+// ---------- Mouvement (port de CGameMovement, Source SDK 2013) ----------
+const P = { pos: [0, 0, 0], prev: [0, 0, 0], vel: [0, 0, 0], ground: false };
+const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+
+function clipVelocity(v, n, overbounce) {
+  const back = dot(v, n) * overbounce;
+  const out = v.map((x, i) => { const r = x - n[i] * back; return r > -0.1 && r < 0.1 ? 0 : r; });
+  const adj = dot(out, n);
+  if (adj < 0) for (let i = 0; i < 3; i++) out[i] -= n[i] * adj;
+  return out;
+}
+
+function tryPlayerMove(dt) {
+  const primal = P.vel.slice(), planes = [];
+  let orig = P.vel.slice(), timeLeft = dt, allFrac = 0;
+  for (let bump = 0; bump < 4; bump++) {
+    if (!P.vel[0] && !P.vel[1] && !P.vel[2]) break;
+    const end = P.pos.map((x, i) => x + P.vel[i] * timeLeft);
+    const t = traceHull(P.pos, end);
+    allFrac += t.fraction;
+    if (t.allsolid) { P.vel = [0, 0, 0]; return; }
+    if (t.fraction > 0) { P.pos = t.endpos; orig = P.vel.slice(); planes.length = 0; }
+    if (t.fraction === 1) break;
+    timeLeft -= timeLeft * t.fraction;
+    if (planes.length >= 5) { P.vel = [0, 0, 0]; break; }
+    planes.push(t.normal);
+    if (planes.length === 1 && !P.ground) {
+      P.vel = orig = clipVelocity(orig, planes[0], 1); // c'est ça, le surf
+    } else {
+      let i;
+      for (i = 0; i < planes.length; i++) {
+        P.vel = clipVelocity(orig, planes[i], 1);
+        let j;
+        for (j = 0; j < planes.length; j++) if (j !== i && dot(P.vel, planes[j]) < 0) break;
+        if (j === planes.length) break;
+      }
+      if (i === planes.length) {
+        if (planes.length !== 2) { P.vel = [0, 0, 0]; break; }
+        const [a, b] = planes;
+        const dir = [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+        const len = Math.hypot(...dir) || 1, d = dot(dir, P.vel) / (len * len);
+        P.vel = dir.map(x => x * d);
+      }
+      if (dot(P.vel, primal) <= 0) { P.vel = [0, 0, 0]; break; }
+    }
+  }
+  if (allFrac === 0) P.vel = [0, 0, 0];
+}
+
+function accelerate(wishdir, wishspeed, accel, cap, dt) {
+  const add = Math.min(wishspeed, cap) - dot(P.vel, wishdir);
+  if (add <= 0) return;
+  const acc = Math.min(accel * wishspeed * dt, add);
+  for (let i = 0; i < 3; i++) P.vel[i] += acc * wishdir[i];
+}
+
+function friction(dt) {
+  const speed = Math.hypot(...P.vel);
+  if (speed < 0.1) return;
+  const drop = Math.max(speed, CFG.stopspeed) * CFG.friction * dt;
+  const k = Math.max(speed - drop, 0) / speed;
+  for (let i = 0; i < 3; i++) P.vel[i] *= k;
+}
+
+function categorize() {
+  if (P.vel[2] > 140) { P.ground = false; return; } // NON_JUMP_VELOCITY : on décolle des pentes
+  const t = traceHull(P.pos, [P.pos[0], P.pos[1], P.pos[2] - 2]);
+  P.ground = t.fraction < 1 && t.normal[2] >= 0.7; // < 0.7 = ramp = surf
+}
+
+function stayOnGround() {
+  const up = [P.pos[0], P.pos[1], P.pos[2] + 2], down = [P.pos[0], P.pos[1], P.pos[2] - CFG.stepsize];
+  const t0 = traceHull(P.pos, up), t = traceHull(t0.endpos, down);
+  if (t.fraction > 0 && t.fraction < 1 && !t.startsolid && t.normal[2] >= 0.7) P.pos = t.endpos;
+}
+
+function stepMove(dt) {
+  const startPos = P.pos.slice(), startVel = P.vel.slice();
+  tryPlayerMove(dt);
+  const downPos = P.pos, downVel = P.vel;
+  P.pos = startPos; P.vel = startVel.slice();
+  P.pos = traceHull(P.pos, [P.pos[0], P.pos[1], P.pos[2] + CFG.stepsize]).endpos;
+  tryPlayerMove(dt);
+  const t = traceHull(P.pos, [P.pos[0], P.pos[1], P.pos[2] - CFG.stepsize]);
+  if (t.normal[2] < 0.7 && t.fraction < 1) { P.pos = downPos; P.vel = downVel; return; }
+  if (!t.startsolid && !t.allsolid) P.pos = t.endpos;
+  const d2 = (a) => (a[0] - startPos[0]) ** 2 + (a[1] - startPos[1]) ** 2;
+  if (d2(downPos) > d2(P.pos)) { P.pos = downPos; P.vel = downVel; }
+  else P.vel[2] = downVel[2];
+}
+
+function wish(yaw) {
+  const fx = Math.cos(yaw), fy = Math.sin(yaw), rx = Math.sin(yaw), ry = -Math.cos(yaw);
+  const fm = (keys.KeyW ? 1 : 0) - (keys.KeyS ? 1 : 0), sm = (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0);
+  const w = [fx * fm + rx * sm, fy * fm + ry * sm, 0];
+  const len = Math.hypot(w[0], w[1]);
+  return len ? { dir: [w[0] / len, w[1] / len, 0], speed: CFG.maxspeed } : { dir: [0, 0, 0], speed: 0 };
+}
+
+function playerTick(dt, yaw, jump) {
+  P.prev = P.pos.slice();
+  P.vel[2] -= CFG.gravity * 0.5 * dt;
+  if (jump && P.ground) { P.vel[2] = CFG.jump; P.ground = false; } // autobhop : espace maintenu
+  if (P.ground) { P.vel[2] = 0; friction(dt); }
+  const w = wish(yaw);
+  if (P.ground) {
+    accelerate(w.dir, w.speed, CFG.accelerate, Infinity, dt);
+    P.vel[2] = 0;
+    const dest = [P.pos[0] + P.vel[0] * dt, P.pos[1] + P.vel[1] * dt, P.pos[2]];
+    const t = traceHull(P.pos, dest);
+    if (t.fraction === 1) P.pos = t.endpos; else stepMove(dt);
+    stayOnGround();
+  } else {
+    accelerate(w.dir, w.speed, CFG.airaccelerate, 30, dt);
+    tryPlayerMove(dt);
+  }
+  categorize();
+  for (let i = 0; i < 3; i++) P.vel[i] = Math.max(-CFG.maxvelocity, Math.min(CFG.maxvelocity, P.vel[i]));
+  if (!P.ground) P.vel[2] -= CFG.gravity * 0.5 * dt;
+  else P.vel[2] = 0;
+  runTick();
+}
+
+function teleport(dest, yaw) {
+  P.pos = dest.slice(); P.prev = dest.slice(); P.vel = [0, 0, 0];
+  camera.rotation.set(0, (yaw - 90) * Math.PI / 180, 0);
+  categorize();
+}
+
+// ---------- Zones et timer ----------
+// Boîtes [mins, maxs] en unités Source. Préréglées ici, ou posées en noclip avec J (départ) / K (arrivée)
+const ZONES = {
+  surf_utopia_v3: { start: [[-14336, -1088, 12790], [-13760, 1088, 13100]], end: [[-14336, -1024, -6730], [-13824, 1024, -6400]] },
+};
+const GROUND_LIMIT = 20; // ticks au sol tolérés (0,2 s) : assez pour enchaîner un bhop, pas pour marcher
+const store = {
+  get: k => { try { return JSON.parse(localStorage.getItem(k)); } catch { return null; } },
+  set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+};
+// state : idle (libre, pas de timer) | start (dans la zone de départ) | run | done
+const run = { state: 'idle', ticks: 0, ground: 0, best: null };
+let zones = {}, mapName = '', corner = null, zoneMeshes = [];
+
+const inBox = (p, z) => z && p[0] + 16 >= z[0][0] && p[0] - 16 <= z[1][0] && p[1] + 16 >= z[0][1] && p[1] - 16 <= z[1][1] && p[2] + 72 >= z[0][2] && p[2] <= z[1][2];
+
+function runTick() {
+  if (run.state === 'start' && !inBox(P.pos, zones.start)) { run.state = 'run'; run.ticks = 0; run.ground = 0; }
+  if (run.state !== 'run') return;
+  run.ticks++;
+  if (inBox(P.pos, zones.end)) {
+    run.state = 'done';
+    if (!run.best || run.ticks < run.best) { run.best = run.ticks; store.set('surf-best:' + mapName, run.best); }
+    return;
+  }
+  run.ground = P.ground ? run.ground + 1 : 0;
+  if (run.ground > GROUND_LIMIT) respawn();
+}
+
+function respawn() {
+  let pos = map.spawn.pos;
+  const s = zones.start;
+  if (s && !inBox(pos, s)) { // spawn de la map hors de la zone posée : on lâche le joueur au centre de la zone
+    const x = (s[0][0] + s[1][0]) / 2, y = (s[0][1] + s[1][1]) / 2;
+    pos = traceHull([x, y, s[1][2]], [x, y, s[0][2]]).endpos;
+  }
+  teleport(pos, map.spawn.yaw);
+  Object.assign(run, { state: s ? 'start' : 'idle', ticks: 0, ground: 0 });
+}
+
+function drawZones() {
+  for (const m of zoneMeshes) scene.remove(m);
+  zoneMeshes = ['start', 'end'].filter(k => zones[k]).map(k => {
+    const [a, b] = zones[k];
+    const box = new THREE.Box3(new THREE.Vector3(a[0], a[2], -b[1]), new THREE.Vector3(b[0], b[2], -a[1]));
+    const helper = new THREE.Box3Helper(box, k === 'start' ? 0x3ddc84 : 0xff5a5a);
+    scene.add(helper);
+    return helper;
+  });
+}
+
+// Deux appuis sur la même touche = deux coins opposés, à la position de la caméra
+function placeCorner(kind) {
+  const c = camera.position, p = [c.x, -c.z, c.y];
+  if (corner?.kind !== kind) { corner = { kind, p }; return; }
+  const a = corner.p;
+  corner = null;
+  zones[kind] = [[Math.min(a[0], p[0]), Math.min(a[1], p[1]), Math.min(a[2], p[2]) - CFG.eye - 16],
+                 [Math.max(a[0], p[0]), Math.max(a[1], p[1]), Math.max(a[2], p[2]) + 64]];
+  store.set('surf-zones:' + mapName, zones);
+  drawZones();
+}
+
+const fmt = ticks => { const t = ticks * CFG.tick; return `${Math.floor(t / 60)}:${(t % 60).toFixed(2).padStart(5, '0')}`; };
+function runText() {
+  if (noclip) return corner ? `Coin 1 posé : ${corner.kind === 'start' ? 'J' : 'K'} pour le coin opposé` : 'Noclip · J = zone de départ · K = zone d\'arrivée';
+  const best = run.best ? ` · record ${fmt(run.best)}` : '';
+  if (run.state === 'idle') return zones.start ? 'Entraînement libre · R pour lancer un run' : 'Pas de zones · V puis J / K pour les poser';
+  if (run.state === 'start') return 'Prêt' + best;
+  if (run.state === 'run') return fmt(run.ticks);
+  return `Terminé en ${fmt(run.ticks)}` + (run.best === run.ticks ? ' · nouveau record !' : best);
+}
+
+// ---------- Viewer ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(devicePixelRatio);
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x87a9d6);
+const camera = new THREE.PerspectiveCamera(90, innerWidth / innerHeight, 4, 100000);
+camera.rotation.order = 'YXZ';
+scene.add(new THREE.HemisphereLight(0xffffff, 0x445066, 0.75));
+const sun = new THREE.DirectionalLight(0xffffff, 0.6);
+sun.position.set(0.4, 1, 0.25);
+scene.add(sun);
+
+const hud = document.getElementById('hud'), speedEl = document.getElementById('speed'), modeBtn = document.getElementById('mode');
+const mapsEl = document.getElementById('maps'), errEl = document.getElementById('err');
+let info = '', map = null, mesh = null, noclip = false;
+
+function loadMap(buf, name) {
+  const t0 = performance.now();
+  map = null;
+  const m = parseBSP(buf);
+  W = m.col_;
+  checked = new Int32Array(W.brushes.length / 3);
+  if (mesh) { scene.remove(mesh); mesh.geometry.dispose(); }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(m.pos, 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(m.col, 3));
+  geo.computeVertexNormals(); // non indexé -> normales plates
+  scene.add(mesh = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide })));
+  map = m;
+  mapName = name;
+  // copie : l'éditeur modifie zones, il ne doit pas écraser les préréglages
+  zones = store.get('surf-zones:' + name) || structuredClone(ZONES[name] || {});
+  run.best = store.get('surf-best:' + name);
+  corner = null;
+  drawZones();
+  respawn();
+  info = `${name}  (VBSP v${map.version})\n${map.faces} faces, ${map.props} props, ${map.tris} triangles\nparse ${Math.round(performance.now() - t0)} ms\n\nclic = souris | ZQSD/WASD | espace = saut (auto)\nV = noclip | R = respawn | M = maps\nJ / K en noclip = zones départ / arrivée`;
+  mapsEl.hidden = true;
+  hud.hidden = false; document.getElementById('menu').hidden = false; speedEl.hidden = false;
+}
+
+const showError = e => { console.error(e); errEl.textContent = e.message; errEl.hidden = false; };
+
+async function openMap(name, btn, getBuffer) {
+  errEl.hidden = true;
+  btn.textContent = `${name} — chargement…`;
+  try { loadMap(await getBuffer(), name); }
+  catch (e) { showError(e); }
+  btn.textContent = name;
+}
+
+const fetchMap = name => async () => {
+  let res;
+  try { res = await fetch(`maps/${name}.bsp`); }
+  catch {
+    throw new Error(location.protocol === 'file:'
+      ? 'Le navigateur bloque le chargement en file://.\nLance un serveur dans le dossier du projet :\npython3 -m http.server\npuis ouvre http://localhost:8000'
+      : `maps/${name}.bsp inaccessible`);
+  }
+  if (!res.ok) throw new Error(`maps/${name}.bsp introuvable (${res.status})`);
+  return res.arrayBuffer();
+};
+
+// Maps chargées par le joueur, gardées dans SON navigateur (IndexedDB : un .bsp est trop gros pour localStorage)
+const idb = (mode, fn) => new Promise((ok, ko) => {
+  const open = indexedDB.open('surf', 1);
+  open.onupgradeneeded = () => open.result.createObjectStore('maps');
+  open.onerror = () => ko(open.error);
+  open.onsuccess = () => {
+    const tx = open.result.transaction('maps', mode), req = fn(tx.objectStore('maps'));
+    tx.oncomplete = () => ok(req.result);
+    tx.onerror = tx.onabort = () => ko(tx.error);
+  };
+});
+
+async function buildMapList() {
+  const list = document.getElementById('list');
+  list.replaceChildren();
+  const add = (name, getBuffer, onRemove) => {
+    const row = document.createElement('div'), btn = document.createElement('button');
+    btn.textContent = name;
+    btn.onclick = () => openMap(name, btn, getBuffer);
+    row.append(btn);
+    if (onRemove) {
+      const del = document.createElement('button');
+      del.textContent = '×';
+      del.title = `Retirer ${name} du menu`;
+      del.onclick = onRemove;
+      row.append(del);
+    }
+    list.append(row);
+  };
+  for (const name of MAPS) add(name, fetchMap(name));
+  let saved = [];
+  try { saved = await idb('readonly', s => s.getAllKeys()); } catch {} // stockage bloqué (navigation privée...) : pas de maps perso
+  for (const name of saved)
+    add(name, async () => (await idb('readonly', s => s.get(name))).arrayBuffer(),
+      async () => { await idb('readwrite', s => s.delete(name)); buildMapList(); });
+}
+buildMapList();
+
+// Map fournie par le joueur : lue en local, rien n'est envoyé, puis ajoutée à son menu
+const fileEl = document.getElementById('file');
+document.getElementById('load').onclick = () => fileEl.click();
+fileEl.onchange = async () => {
+  const f = fileEl.files[0];
+  fileEl.value = ''; // permet de recharger le même fichier
+  if (!f) return;
+  errEl.hidden = true;
+  const name = f.name.replace(/\.bsp$/i, '');
+  try { loadMap(await f.arrayBuffer(), name); }
+  catch (e) { return showError(e); }
+  try { await idb('readwrite', s => s.put(f, name)); buildMapList(); }
+  catch (e) { showError(new Error(`Map jouable mais pas gardée dans le menu : ${e.message}`)); }
+};
+const showMaps = () => { document.exitPointerLock(); mapsEl.hidden = false; };
+document.getElementById('maps-btn').onclick = e => { showMaps(); e.target.blur(); };
+
+function toggleNoclip() {
+  noclip = !noclip;
+  run.state = 'idle'; // un run passé par le noclip ne compte pas : R pour en relancer un
+  modeBtn.textContent = `Mode : ${noclip ? 'noclip' : 'surf'} (V)`;
+  if (!noclip) { // on reprend le joueur là où est la caméra
+    const c = camera.position;
+    P.pos = [c.x, -c.z, c.y - CFG.eye]; P.prev = P.pos.slice(); P.vel = [0, 0, 0];
+    categorize();
+  }
+}
+modeBtn.onclick = e => { toggleNoclip(); e.target.blur(); };
+document.getElementById('respawn').onclick = e => { respawn(); e.target.blur(); };
+// Oublie les zones posées pour cette map : retour aux zones préréglées (ou aucune)
+document.getElementById('reset-zones').onclick = e => {
+  try { localStorage.removeItem('surf-zones:' + mapName); } catch {}
+  zones = structuredClone(ZONES[mapName] || {});
+  corner = null;
+  drawZones();
+  respawn();
+  e.target.blur();
+};
+
+const keys = {};
+addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return; // on tape la sensi, pas de raccourcis
+  keys[e.code] = true;
+  if (!map || e.repeat) return;
+  // e.key pour les raccourcis (lettre affichée, AZERTY ou QWERTY), e.code pour le déplacement (position)
+  const k = e.key.toLowerCase();
+  if (k === 'v') toggleNoclip();
+  if (k === 'r') respawn();
+  if (noclip && k === 'j') placeCorner('start');
+  if (noclip && k === 'k') placeCorner('end');
+  if (k === 'm') showMaps();
+});
+addEventListener('keyup', e => keys[e.code] = false);
+renderer.domElement.onclick = () => {
+  const el = renderer.domElement;
+  // unadjustedMovement : mouvements bruts, sans l'accélération de l'OS, comme dans CS (repli si non supporté)
+  el.requestPointerLock({ unadjustedMovement: true })?.catch(() => el.requestPointerLock());
+};
+// Sensibilité à la CS : sensi × m_yaw (0,022°) par count
+const sensEl = document.getElementById('sens');
+let sens = store.get('surf-sens') || 2;
+sensEl.value = sens;
+sensEl.onchange = () => {
+  sens = Math.min(20, Math.max(0.1, +sensEl.value || 2));
+  sensEl.value = sens;
+  store.set('surf-sens', sens);
+  sensEl.blur();
+};
+addEventListener('mousemove', e => {
+  if (document.pointerLockElement !== renderer.domElement) return;
+  const r = sens * 0.022 * Math.PI / 180;
+  camera.rotation.y -= e.movementX * r;
+  camera.rotation.x = Math.max(-1.55, Math.min(1.55, camera.rotation.x - e.movementY * r));
+});
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+const clock = new THREE.Clock(), fwd = new THREE.Vector3(), right = new THREE.Vector3();
+let acc = 0;
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.1);
+  if (map && noclip) {
+    const speed = (keys.ShiftLeft ? 3000 : 800) * dt;
+    camera.getWorldDirection(fwd);
+    right.crossVectors(fwd, camera.up).normalize();
+    // KeyW/KeyA = position physique : marche en AZERTY (Z/Q) comme en QWERTY
+    if (keys.KeyW) camera.position.addScaledVector(fwd, speed);
+    if (keys.KeyS) camera.position.addScaledVector(fwd, -speed);
+    if (keys.KeyD) camera.position.addScaledVector(right, speed);
+    if (keys.KeyA) camera.position.addScaledVector(right, -speed);
+    if (keys.Space) camera.position.y += speed;
+    if (keys.ControlLeft) camera.position.y -= speed;
+  } else if (map) {
+    // Tick fixe comme un serveur, rendu interpolé entre deux ticks
+    for (acc += dt; acc >= CFG.tick; acc -= CFG.tick) playerTick(CFG.tick, camera.rotation.y + Math.PI / 2, keys.Space);
+    const a = acc / CFG.tick, p = P.prev.map((x, i) => x + (P.pos[i] - x) * a);
+    camera.position.set(p[0], p[2] + CFG.eye, -p[1]);
+  }
+  if (map) {
+    const c = camera.position;
+    hud.textContent = info + `\n\npos ${Math.round(c.x)} ${Math.round(-c.z)} ${Math.round(c.y)}`;
+    speedEl.textContent = runText() + (noclip ? '' : '\n' + Math.round(Math.hypot(P.vel[0], P.vel[1])));
+  }
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>
